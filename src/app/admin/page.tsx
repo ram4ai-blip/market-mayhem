@@ -1,310 +1,296 @@
 'use client'
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { supabase } from '@/lib/supabase'
+import { NEWS_SCRIPT, TEAMS } from '@/lib/gameData'
 
 const ADMIN_PWD = 'marketadmin2024'
 
 export default function AdminPage() {
   const [authed, setAuthed] = useState(false)
   const [pwd, setPwd] = useState('')
+  const [authErr, setAuthErr] = useState('')
   const [gameState, setGameState] = useState<any>(null)
   const [teams, setTeams] = useState<any[]>([])
   const [prices, setPrices] = useState<any[]>([])
-  const [holdings, setHoldings] = useState<any[]>([])
   const [msg, setMsg] = useState('')
   const [loading, setLoading] = useState(false)
-  const [timeLeft, setTimeLeft] = useState<number | null>(null)
-  const timerRef = useRef<any>(null)
-  const priceTickRef = useRef<any>(null)
-  const minuteTickRef = useRef<any>(null)
-  const autoAdvanceRef = useRef(false)
-  const gameStateRef = useRef<any>(null)  // always-current ref for intervals
+  const [timeLeft, setTimeLeft] = useState(0)
 
-  // Keep ref in sync with state
-  useEffect(() => { gameStateRef.current = gameState }, [gameState])
+  const gsRef = useRef<any>(null)
+  const advancingRef = useRef(false)
 
-  useEffect(() => {
-    if (!authed) return
-    fetchAll()
-    // Poll every 3s so admin view stays fresh too
-    const poll = setInterval(() => fetchAll(), 3000)
-    const channel = supabase.channel('admin-rt')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'game_state' }, fetchAll)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' }, fetchAll)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'stock_prices' }, fetchAll)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'holdings' }, fetchAll)
-      .subscribe()
-    return () => { clearInterval(poll); supabase.removeChannel(channel) }
-  }, [authed])
+  useEffect(() => { gsRef.current = gameState }, [gameState])
 
-  // Countdown timer — runs off phase_ends_at from DB, always in sync
-  useEffect(() => {
-    if (timerRef.current) clearInterval(timerRef.current)
-    if (gameState?.phase_ends_at && (gameState.status === 'trading' || gameState.status === 'break')) {
-      timerRef.current = setInterval(() => {
-        const left = Math.max(0, Math.floor((new Date(gameState.phase_ends_at).getTime() - Date.now()) / 1000))
-        setTimeLeft(left)
-      }, 500)
-    } else {
-      setTimeLeft(null)
-    }
-    return () => { if (timerRef.current) clearInterval(timerRef.current) }
-  }, [gameState?.phase_ends_at, gameState?.status])
-
-  // Auto-advance intervals — use ref so they always see latest game state
-  useEffect(() => {
-    if (priceTickRef.current) clearInterval(priceTickRef.current)
-    if (minuteTickRef.current) clearInterval(minuteTickRef.current)
-
-    if (gameState?.status === 'trading' && autoAdvanceRef.current) {
-      // Price noise every 10s
-      priceTickRef.current = setInterval(() => {
-        if (gameStateRef.current?.status === 'trading') {
-          callAdmin('price_tick', true)
-        }
-      }, 10000)
-
-      // Minute advance every 60s
-      minuteTickRef.current = setInterval(() => {
-        if (gameStateRef.current?.status === 'trading') {
-          callAdmin('next_minute', true)
-        }
-      }, 60000)
-    }
-
-    return () => {
-      if (priceTickRef.current) clearInterval(priceTickRef.current)
-      if (minuteTickRef.current) clearInterval(minuteTickRef.current)
-    }
-  }, [gameState?.status, gameState?.current_minute])
-
-  async function fetchAll() {
-    const [gsRes, teamsRes, pricesRes, holdingsRes] = await Promise.all([
+  const fetchAll = useCallback(async () => {
+    const [gsRes, teamsRes, pricesRes] = await Promise.all([
       supabase.from('game_state').select('*').eq('id', 1).single(),
       supabase.from('teams').select('*'),
       supabase.from('stock_prices').select('*').order('symbol'),
-      supabase.from('holdings').select('*'),
     ])
     if (gsRes.data) setGameState(gsRes.data)
     if (teamsRes.data) setTeams(teamsRes.data)
     if (pricesRes.data) setPrices(pricesRes.data)
-    if (holdingsRes.data) setHoldings(holdingsRes.data)
-  }
+  }, [])
 
-  async function callAdmin(action: string, silent = false) {
-    if (!silent) { setLoading(true); setMsg('') }
+  useEffect(() => {
+    if (!authed) return
+    fetchAll()
+    const channel = supabase.channel('admin-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'game_state' }, (p) => {
+        setGameState(p.new)
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' }, fetchAll)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'stock_prices' }, (p) => {
+        setPrices(prev => prev.map((x: any) => x.symbol === (p.new as any).symbol ? p.new : x))
+      })
+      .subscribe()
+    return () => { supabase.removeChannel(channel) }
+  }, [authed, fetchAll])
+
+  // Timer — reads phase_ends_at from DB (same source as participants)
+  useEffect(() => {
+    if (!gameState?.phase_ends_at) { setTimeLeft(0); return }
+    const tick = () => {
+      const left = Math.max(0, Math.floor((new Date(gameState.phase_ends_at).getTime() - Date.now()) / 1000))
+      setTimeLeft(left)
+    }
+    tick()
+    const interval = setInterval(tick, 500)
+    return () => clearInterval(interval)
+  }, [gameState?.phase_ends_at])
+
+  // Master game loop — price tick every 5s + auto advance when timer hits 0
+  useEffect(() => {
+    if (!authed) return
+
+    const tickInterval = setInterval(async () => {
+      const gs = gsRef.current
+      if (!gs || gs.status !== 'trading') return
+      await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'price_tick', password: ADMIN_PWD })
+      })
+    }, 5000)
+
+    const advanceInterval = setInterval(async () => {
+      const gs = gsRef.current
+      if (!gs || (gs.status !== 'trading' && gs.status !== 'break')) return
+      if (!gs.phase_ends_at) return
+      const left = new Date(gs.phase_ends_at).getTime() - Date.now()
+      if (left > 1500) return
+      if (advancingRef.current) return
+      advancingRef.current = true
+      await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'advance', password: ADMIN_PWD })
+      })
+      await fetchAll()
+      setTimeout(() => { advancingRef.current = false }, 3000)
+    }, 1000)
+
+    return () => { clearInterval(tickInterval); clearInterval(advanceInterval) }
+  }, [authed, fetchAll])
+
+  async function callAdmin(action: string) {
+    setLoading(true)
+    setMsg('')
     try {
       const res = await fetch('/api/admin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, password: ADMIN_PWD }),
+        body: JSON.stringify({ action, password: ADMIN_PWD })
       })
       const data = await res.json()
-      if (!silent) {
-        if (data.error) setMsg('❌ ' + data.error)
-        else setMsg('✅ ' + data.message)
-        fetchAll()
-      }
+      if (data.error) setMsg('❌ ' + data.error)
+      else setMsg('✅ ' + data.message)
+      await fetchAll()
     } catch {
-      if (!silent) setMsg('❌ Network error')
+      setMsg('❌ Network error')
     }
-    if (!silent) setLoading(false)
+    setLoading(false)
+    setTimeout(() => setMsg(''), 4000)
   }
 
-  async function handleStart() {
-    autoAdvanceRef.current = true
-    await callAdmin('start')
-  }
-
-  async function handleNextDay() {
-    autoAdvanceRef.current = true
-    await callAdmin('next_day')
-  }
-
-  async function handleReset() {
-    if (!confirm('Reset everything? All participants will be kicked out.')) return
-    autoAdvanceRef.current = false
-    if (priceTickRef.current) clearInterval(priceTickRef.current)
-    if (minuteTickRef.current) clearInterval(minuteTickRef.current)
-    await callAdmin('reset')
-  }
-
-  // Compute leaderboard with portfolio values
-  const leaderboard = teams.map(t => {
-    const portfolioVal = holdings
-      .filter(h => h.team_name === t.name && h.quantity > 0)
-      .reduce((sum, h) => sum + h.quantity * (prices.find(p => p.symbol === h.symbol)?.price || 0), 0)
-    const total = t.cash + portfolioVal
-    const ret = ((total - 1000000) / 1000000) * 100
-    return { ...t, portfolioVal, total, ret }
-  }).sort((a, b) => b.total - a.total)
-
-  const statusColor = gameState?.status === 'trading' ? '#00e676'
-    : gameState?.status === 'break' ? '#ffab00'
-    : gameState?.status === 'finished' ? '#448aff' : '#6b6b80'
-
-  const timerColor = timeLeft !== null && timeLeft <= 20 ? '#ff1744'
-    : timeLeft !== null && timeLeft <= 40 ? '#ffab00' : '#00e676'
-
-  // ── LOGIN ──────────────────────────────────────────────
   if (!authed) return (
-    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0a0f' }}>
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0a0f', fontFamily: 'Inter, sans-serif' }}>
       <div style={{ background: '#111118', border: '1px solid #2a2a3a', borderRadius: '16px', padding: '40px', width: '360px' }}>
-        <h2 style={{ marginBottom: '8px', fontSize: '20px', color: '#e8e8f0' }}>Admin Login</h2>
-        <p style={{ fontSize: '12px', color: '#6b6b80', marginBottom: '24px' }}>Market Mayhem Control Panel</p>
-        <input type="password" value={pwd} onChange={e => setPwd(e.target.value)}
-          onKeyDown={e => e.key === 'Enter' && (pwd === ADMIN_PWD ? setAuthed(true) : setMsg('Wrong password'))}
+        <p style={{ fontSize: '11px', color: '#6b6b80', letterSpacing: '2px', marginBottom: '8px' }}>ADMIN ACCESS</p>
+        <h2 style={{ fontSize: '22px', fontWeight: 700, marginBottom: '24px', color: '#e8e8f0' }}>Market Mayhem</h2>
+        <input
+          type="password" value={pwd}
+          onChange={e => { setPwd(e.target.value); setAuthErr('') }}
+          onKeyDown={e => e.key === 'Enter' && (pwd === ADMIN_PWD ? setAuthed(true) : setAuthErr('Wrong password'))}
           placeholder="Enter admin password"
-          style={{ width: '100%', padding: '12px 16px', background: '#1a1a24', border: '1px solid #2a2a3a', borderRadius: '8px', color: '#e8e8f0', fontSize: '15px', outline: 'none', marginBottom: '12px', boxSizing: 'border-box' }} />
-        {msg && <p style={{ color: '#ff1744', fontSize: '13px', marginBottom: '12px' }}>{msg}</p>}
-        <button onClick={() => pwd === ADMIN_PWD ? setAuthed(true) : setMsg('Wrong password')}
-          style={{ width: '100%', padding: '12px', background: '#00e676', color: '#000', border: 'none', borderRadius: '8px', fontWeight: 700, fontSize: '15px', cursor: 'pointer' }}>
-          Login
+          style={{ width: '100%', padding: '12px 16px', background: '#1a1a24', border: '1px solid #2a2a3a', borderRadius: '8px', color: '#e8e8f0', fontSize: '15px', outline: 'none', marginBottom: '8px', boxSizing: 'border-box' }}
+        />
+        {authErr && <p style={{ color: '#ff1744', fontSize: '13px', marginBottom: '10px' }}>{authErr}</p>}
+        <button
+          onClick={() => pwd === ADMIN_PWD ? setAuthed(true) : setAuthErr('Wrong password')}
+          style={{ width: '100%', padding: '13px', background: '#00e676', color: '#000', border: 'none', borderRadius: '8px', fontWeight: 700, fontSize: '15px', cursor: 'pointer' }}>
+          Login →
         </button>
+        <p style={{ fontSize: '12px', color: '#6b6b80', marginTop: '12px', textAlign: 'center' }}>Default: marketadmin2024</p>
       </div>
     </div>
   )
 
-  // ── MAIN ──────────────────────────────────────────────
+  const isTrading = gameState?.status === 'trading'
+  const isBreak = gameState?.status === 'break'
+  const currentNews = gameState ? NEWS_SCRIPT.find((n: any) => n.day === gameState.current_day && n.minute === gameState.current_minute) : null
+
+  // Display timer: trading shows full 6-min countdown, break shows 2-min countdown
+  const displayTime = isTrading
+    ? Math.max(0, (6 - gameState.current_minute) * 60 + timeLeft)
+    : timeLeft
+  const displayMins = Math.floor(displayTime / 60)
+  const displaySecs = String(displayTime % 60).padStart(2, '0')
+  const timerColor = displayTime <= 30 ? '#ff1744' : displayTime <= 60 ? '#ffab00' : '#00e676'
+
+  const statusColor = isTrading ? '#00e676' : isBreak ? '#ffab00' : gameState?.status === 'finished' ? '#448aff' : '#6b6b80'
+
   return (
-    <div style={{ minHeight: '100vh', background: '#0a0a0f', padding: '20px', fontFamily: 'Inter, sans-serif', color: '#e8e8f0' }}>
+    <div style={{ minHeight: '100vh', background: '#0a0a0f', padding: '24px', fontFamily: 'Inter, sans-serif', color: '#e8e8f0' }}>
       <div style={{ maxWidth: '1300px', margin: '0 auto' }}>
 
         {/* Header */}
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '28px' }}>
           <div>
-            <p style={{ fontSize: '10px', color: '#6b6b80', letterSpacing: '3px', textTransform: 'uppercase' }}>Admin Panel</p>
-            <h1 style={{ fontSize: '26px', fontWeight: 700 }}>Market Mayhem</h1>
+            <p style={{ fontSize: '11px', color: '#6b6b80', letterSpacing: '2px', textTransform: 'uppercase' }}>Admin Panel</p>
+            <h1 style={{ fontSize: '28px', fontWeight: 700 }}>Market Mayhem</h1>
           </div>
-          <div style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
-            {timeLeft !== null && (
-              <div style={{ textAlign: 'center', padding: '6px 20px', borderRadius: '10px', border: `1px solid ${timerColor}`, background: `${timerColor}18` }}>
-                <p style={{ fontSize: '10px', color: '#6b6b80', textTransform: 'uppercase', letterSpacing: '1px' }}>
-                  {gameState?.status === 'trading' ? 'Minute Ends' : 'Break Ends'}
-                </p>
-                <p style={{ fontSize: '22px', fontWeight: 800, fontFamily: 'monospace', color: timerColor }}>
-                  {Math.floor(timeLeft / 60)}:{String(timeLeft % 60).padStart(2, '0')}
-                </p>
-              </div>
-            )}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+            {msg && <span style={{ fontSize: '13px', color: msg.startsWith('✅') ? '#00e676' : '#ff1744' }}>{msg}</span>}
             <div style={{ padding: '8px 20px', borderRadius: '20px', border: `1px solid ${statusColor}`, color: statusColor, fontSize: '12px', fontWeight: 700, letterSpacing: '1px', textTransform: 'uppercase' }}>
-              {gameState?.status || '...'}
+              {gameState?.status || 'Loading...'}
             </div>
           </div>
         </div>
 
         <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gap: '20px' }}>
 
-          {/* LEFT — Controls */}
+          {/* LEFT PANEL */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
 
+            {/* Game Controls */}
             <div style={{ background: '#111118', border: '1px solid #2a2a3a', borderRadius: '12px', padding: '20px' }}>
-              <p style={{ fontSize: '10px', color: '#6b6b80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '16px' }}>Game Controls</p>
+              <p style={{ fontSize: '11px', color: '#6b6b80', letterSpacing: '1px', textTransform: 'uppercase', marginBottom: '16px' }}>Game Status</p>
 
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '16px' }}>
-                {[{ label: 'Day', value: `${gameState?.current_day ?? '-'}/5` }, { label: 'Minute', value: `${gameState?.current_minute ?? '-'}/6` }].map(({ label, value }) => (
-                  <div key={label} style={{ background: '#1a1a24', borderRadius: '8px', padding: '10px', textAlign: 'center' }}>
-                    <p style={{ fontSize: '10px', color: '#6b6b80' }}>{label}</p>
-                    <p style={{ fontSize: '20px', fontWeight: 700, fontFamily: 'monospace' }}>{value}</p>
-                  </div>
-                ))}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '16px' }}>
+                <div style={{ background: '#1a1a24', borderRadius: '8px', padding: '12px', textAlign: 'center' }}>
+                  <p style={{ fontSize: '11px', color: '#6b6b80' }}>Day</p>
+                  <p style={{ fontSize: '24px', fontWeight: 700, fontFamily: 'monospace' }}>{gameState?.current_day ?? '-'}/5</p>
+                </div>
+                <div style={{ background: '#1a1a24', borderRadius: '8px', padding: '12px', textAlign: 'center' }}>
+                  <p style={{ fontSize: '11px', color: '#6b6b80' }}>Minute</p>
+                  <p style={{ fontSize: '24px', fontWeight: 700, fontFamily: 'monospace' }}>{gameState?.current_minute ?? '-'}/6</p>
+                </div>
               </div>
 
-              {msg && (
-                <div style={{ marginBottom: '12px', padding: '10px 14px', background: '#1a1a24', borderRadius: '8px', fontSize: '13px', color: msg.startsWith('✅') ? '#00e676' : '#ff1744' }}>
-                  {msg}
+              {/* Timer */}
+              {gameState?.phase_ends_at && (
+                <div style={{ textAlign: 'center', marginBottom: '16px', padding: '14px', background: '#1a1a24', borderRadius: '10px', border: `1px solid ${timerColor}40` }}>
+                  <p style={{ fontSize: '11px', color: '#6b6b80', marginBottom: '4px', letterSpacing: '1px' }}>
+                    {isTrading ? '⏱ TRADING TIME LEFT' : '☕ BREAK TIME LEFT'}
+                  </p>
+                  <p style={{ fontSize: '42px', fontWeight: 800, fontFamily: 'monospace', color: timerColor, lineHeight: 1 }}>
+                    {displayMins}:{displaySecs}
+                  </p>
+                  <p style={{ fontSize: '11px', color: '#6b6b80', marginTop: '6px' }}>Auto advances when timer hits 0</p>
                 </div>
               )}
 
+              {/* Pulse indicator */}
+              {isTrading && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '14px', padding: '8px 12px', background: 'rgba(0,230,118,0.06)', borderRadius: '8px', border: '1px solid rgba(0,230,118,0.15)' }}>
+                  <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: '#00e676', display: 'inline-block', animation: 'pulse 1s infinite' }} />
+                  <span style={{ fontSize: '12px', color: '#00e676' }}>Prices live · updating every 5s</span>
+                </div>
+              )}
+
+              {/* Action buttons */}
               {gameState?.status === 'waiting' && (
-                <button onClick={handleStart} disabled={loading}
-                  style={{ width: '100%', padding: '14px', background: '#00e676', color: '#000', border: 'none', borderRadius: '10px', fontSize: '15px', fontWeight: 800, cursor: 'pointer', marginBottom: '8px' }}>
+                <button onClick={() => callAdmin('start')} disabled={loading}
+                  style={{ width: '100%', padding: '14px', background: '#00e676', color: '#000', border: 'none', borderRadius: '10px', fontSize: '15px', fontWeight: 700, cursor: 'pointer', marginBottom: '8px' }}>
                   {loading ? 'Starting...' : '▶ Start Simulation'}
                 </button>
               )}
-              {gameState?.status === 'trading' && (
-                <button onClick={() => callAdmin('next_minute')} disabled={loading}
-                  style={{ width: '100%', padding: '14px', background: '#448aff', color: '#fff', border: 'none', borderRadius: '10px', fontSize: '15px', fontWeight: 700, cursor: 'pointer', marginBottom: '8px' }}>
-                  {loading ? '...' : '⏭ Next Minute'}
-                </button>
+              {isTrading && (
+                <div style={{ padding: '12px', background: 'rgba(0,230,118,0.06)', border: '1px solid rgba(0,230,118,0.2)', borderRadius: '10px', textAlign: 'center', marginBottom: '8px', fontSize: '13px', color: '#00e676' }}>
+                  🟢 Market OPEN — running automatically
+                </div>
               )}
-              {gameState?.status === 'break' && (
-                <button onClick={handleNextDay} disabled={loading}
-                  style={{ width: '100%', padding: '14px', background: '#ffab00', color: '#000', border: 'none', borderRadius: '10px', fontSize: '15px', fontWeight: 700, cursor: 'pointer', marginBottom: '8px' }}>
-                  {loading ? '...' : '🌅 Start Next Day'}
-                </button>
+              {isBreak && (
+                <div style={{ padding: '12px', background: 'rgba(255,171,0,0.06)', border: '1px solid rgba(255,171,0,0.2)', borderRadius: '10px', textAlign: 'center', marginBottom: '8px', fontSize: '13px', color: '#ffab00' }}>
+                  ☕ Break in progress — auto resumes
+                </div>
               )}
               {gameState?.status === 'finished' && (
-                <div style={{ padding: '14px', background: '#1a1a24', borderRadius: '10px', textAlign: 'center', color: '#00e676', fontWeight: 700, marginBottom: '8px', fontSize: '15px' }}>
+                <div style={{ padding: '14px', background: '#1a1a24', borderRadius: '10px', textAlign: 'center', color: '#00e676', fontWeight: 700, marginBottom: '8px' }}>
                   🏆 Simulation Complete!
                 </div>
               )}
 
-              <button onClick={handleReset} disabled={loading}
-                style={{ width: '100%', padding: '12px', background: 'transparent', color: '#ff1744', border: '1px solid #ff1744', borderRadius: '10px', fontSize: '14px', fontWeight: 600, cursor: 'pointer' }}>
-                ↺ Reset & Kick All
+              <button onClick={() => { if (confirm('Reset everything? All teams and trades will be cleared.')) callAdmin('reset') }}
+                disabled={loading}
+                style={{ width: '100%', padding: '10px', background: 'transparent', color: '#ff1744', border: '1px solid #ff1744', borderRadius: '10px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>
+                ↺ Reset Game
               </button>
             </div>
 
-            {/* Session Flow */}
-            <div style={{ background: '#111118', border: '1px solid #2a2a3a', borderRadius: '12px', padding: '20px' }}>
-              <p style={{ fontSize: '10px', color: '#6b6b80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '12px' }}>Session Flow</p>
-              {[
-                { label: 'Total Duration', value: '40 min' },
-                { label: 'Trading per Day', value: '6 min' },
-                { label: 'Revision Break', value: '2 min' },
-                { label: 'Trading Days', value: '5 days' },
-                { label: 'Price Updates', value: 'Every 10s' },
-              ].map(({ label, value }) => (
-                <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0', borderBottom: '1px solid #1a1a24', fontSize: '12px' }}>
-                  <span style={{ color: '#6b6b80' }}>{label}</span>
-                  <span style={{ fontWeight: 600 }}>{value}</span>
-                </div>
-              ))}
-            </div>
+            {/* Current News */}
+            {currentNews && (
+              <div style={{ background: 'rgba(255,171,0,0.06)', border: '1px solid rgba(255,171,0,0.3)', borderRadius: '12px', padding: '16px' }}>
+                <p style={{ fontSize: '10px', letterSpacing: '2px', color: '#ffab00', marginBottom: '8px' }}>📰 CURRENT NEWS</p>
+                <p style={{ fontWeight: 700, fontSize: '13px', lineHeight: 1.4, color: '#e8e8f0' }}>{currentNews.headline}</p>
+                <p style={{ fontSize: '11px', color: '#6b6b80', marginTop: '6px' }}>{currentNews.detail}</p>
+              </div>
+            )}
 
             {/* Teams */}
-            <div style={{ background: '#111118', border: '1px solid #2a2a3a', borderRadius: '12px', padding: '20px' }}>
-              <p style={{ fontSize: '10px', color: '#6b6b80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '12px' }}>Teams ({teams.length}/7)</p>
-              {teams.length === 0
-                ? <p style={{ color: '#6b6b80', fontSize: '13px' }}>No teams joined yet</p>
-                : teams.map(t => (
-                  <div key={t.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '7px 0', borderBottom: '1px solid #1a1a24' }}>
-                    <span style={{ fontSize: '13px' }}>{t.name}</span>
-                    <span style={{ fontSize: '11px', color: '#00e676' }}>● Online</span>
+            <div style={{ background: '#111118', border: '1px solid #2a2a3a', borderRadius: '12px', padding: '16px' }}>
+              <p style={{ fontSize: '11px', color: '#6b6b80', letterSpacing: '1px', textTransform: 'uppercase', marginBottom: '12px' }}>Teams ({teams.length}/7)</p>
+              {TEAMS.map((t: string) => {
+                const joined = teams.find((x: any) => x.name === t)
+                return (
+                  <div key={t} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '7px 0', borderBottom: '1px solid #1a1a24' }}>
+                    <span style={{ fontSize: '13px', color: joined ? '#e8e8f0' : '#6b6b80' }}>{t}</span>
+                    <span style={{ fontSize: '11px', color: joined ? '#00e676' : '#2a2a3a' }}>{joined ? '● Online' : '○'}</span>
                   </div>
-                ))}
+                )
+              })}
             </div>
           </div>
 
-          {/* RIGHT — Leaderboard + Prices */}
+          {/* RIGHT PANEL */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
 
+            {/* Leaderboard */}
             <div style={{ background: '#111118', border: '1px solid #2a2a3a', borderRadius: '12px', padding: '20px' }}>
-              <p style={{ fontSize: '10px', color: '#6b6b80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '16px' }}>🏆 Live Leaderboard</p>
-              {leaderboard.length === 0
-                ? <p style={{ color: '#6b6b80', fontSize: '13px' }}>No teams yet</p>
+              <p style={{ fontSize: '11px', color: '#6b6b80', letterSpacing: '1px', textTransform: 'uppercase', marginBottom: '16px' }}>
+                🏆 Live Leaderboard <span style={{ color: '#2a2a3a', fontWeight: 400 }}>(hidden from teams)</span>
+              </p>
+              {teams.length === 0
+                ? <p style={{ color: '#6b6b80', fontSize: '13px' }}>No teams joined yet</p>
                 : (
                   <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                     <thead>
                       <tr style={{ borderBottom: '1px solid #2a2a3a' }}>
-                        {['#', 'Team', 'Cash', 'Portfolio', 'Total', 'Return %'].map(h => (
-                          <th key={h} style={{ padding: '8px 10px', textAlign: h === '#' ? 'center' : 'right', fontSize: '10px', color: '#6b6b80', letterSpacing: '1px', fontWeight: 600 }}>{h}</th>
+                        {['#', 'Team', 'Cash'].map(h => (
+                          <th key={h} style={{ padding: '8px 12px', textAlign: 'left', fontSize: '11px', color: '#6b6b80', letterSpacing: '1px', fontWeight: 600 }}>{h}</th>
                         ))}
                       </tr>
                     </thead>
                     <tbody>
-                      {leaderboard.map((t, i) => (
-                        <tr key={t.name} style={{ borderBottom: '1px solid #1a1a24' }}>
-                          <td style={{ padding: '10px', textAlign: 'center', fontSize: '14px' }}>
-                            {i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : <span style={{ color: '#6b6b80' }}>{i + 1}</span>}
+                      {[...teams].sort((a: any, b: any) => b.cash - a.cash).map((t: any, i: number) => (
+                        <tr key={t.name} style={{ borderBottom: '1px solid #1a1a24', background: i === 0 ? 'rgba(0,230,118,0.03)' : 'transparent' }}>
+                          <td style={{ padding: '12px', fontSize: '14px' }}>
+                            {i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : i + 1}
                           </td>
-                          <td style={{ padding: '10px', textAlign: 'right', fontSize: '14px', fontWeight: 600 }}>{t.name}</td>
-                          <td style={{ padding: '10px', textAlign: 'right', fontSize: '12px', fontFamily: 'monospace', color: '#6b6b80' }}>₹{(t.cash / 100000).toFixed(2)}L</td>
-                          <td style={{ padding: '10px', textAlign: 'right', fontSize: '12px', fontFamily: 'monospace', color: '#448aff' }}>₹{(t.portfolioVal / 100000).toFixed(2)}L</td>
-                          <td style={{ padding: '10px', textAlign: 'right', fontSize: '13px', fontFamily: 'monospace', fontWeight: 700 }}>₹{(t.total / 100000).toFixed(2)}L</td>
-                          <td style={{ padding: '10px', textAlign: 'right', fontSize: '14px', fontFamily: 'monospace', fontWeight: 800, color: t.ret >= 0 ? '#00e676' : '#ff1744' }}>
-                            {t.ret >= 0 ? '+' : ''}{t.ret.toFixed(2)}%
+                          <td style={{ padding: '12px', fontSize: '14px', fontWeight: 600 }}>{t.name}</td>
+                          <td style={{ padding: '12px', fontSize: '13px', fontFamily: 'monospace', color: '#00e676' }}>
+                            ₹{(t.cash / 100000).toFixed(2)}L
                           </td>
                         </tr>
                       ))}
@@ -313,17 +299,18 @@ export default function AdminPage() {
                 )}
             </div>
 
+            {/* Live Prices */}
             {prices.length > 0 && (
               <div style={{ background: '#111118', border: '1px solid #2a2a3a', borderRadius: '12px', padding: '20px' }}>
-                <p style={{ fontSize: '10px', color: '#6b6b80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '16px' }}>📈 Live Stock Prices</p>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: '8px' }}>
-                  {prices.map(p => {
-                    const change = ((p.price - p.base_price) / p.base_price) * 100
+                <p style={{ fontSize: '11px', color: '#6b6b80', letterSpacing: '1px', textTransform: 'uppercase', marginBottom: '16px' }}>📈 Live Prices</p>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: '8px' }}>
+                  {prices.map((p: any) => {
+                    const change = p.base_price ? ((p.price - p.base_price) / p.base_price * 100) : 0
                     return (
-                      <div key={p.symbol} style={{ background: '#1a1a24', borderRadius: '8px', padding: '10px 12px' }}>
-                        <p style={{ fontSize: '12px', fontWeight: 700, fontFamily: 'monospace' }}>{p.symbol}</p>
-                        <p style={{ fontSize: '14px', fontWeight: 600, margin: '2px 0' }}>₹{p.price.toFixed(2)}</p>
-                        <p style={{ fontSize: '11px', color: change >= 0 ? '#00e676' : '#ff1744' }}>
+                      <div key={p.symbol} style={{ background: '#1a1a24', borderRadius: '8px', padding: '10px 12px', borderLeft: `3px solid ${change >= 0 ? '#00e676' : '#ff1744'}` }}>
+                        <p style={{ fontSize: '11px', fontWeight: 700, fontFamily: 'monospace' }}>{p.symbol}</p>
+                        <p style={{ fontSize: '14px', fontWeight: 700, fontFamily: 'monospace' }}>₹{Number(p.price).toFixed(0)}</p>
+                        <p style={{ fontSize: '11px', color: change >= 0 ? '#00e676' : '#ff1744', fontFamily: 'monospace' }}>
                           {change >= 0 ? '▲' : '▼'} {Math.abs(change).toFixed(2)}%
                         </p>
                       </div>
@@ -335,6 +322,7 @@ export default function AdminPage() {
           </div>
         </div>
       </div>
+      <style>{`@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
     </div>
   )
 }
