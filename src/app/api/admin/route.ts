@@ -7,7 +7,6 @@ const supabase = createClient(
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im14amdrdnpibWdwem9wYmliYnp2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM0NTU5MTcsImV4cCI6MjA5OTAzMTkxN30.N83Ru9woRgBDC8jRolNtiMH-2nklelFSiPdRwIbRj4U'
 )
 
-// Apply news-driven price change + high volatility noise every tick
 function applyPriceChanges(
   currentPrices: { symbol: string; price: number }[],
   day: number,
@@ -15,24 +14,18 @@ function applyPriceChanges(
   isNoiseTick = false
 ) {
   const newsEvent = NEWS_SCRIPT.find(n => n.day === day && n.minute === minute)
-
   return currentPrices.map(stock => {
     const stockMeta = STOCKS.find(s => s.symbol === stock.symbol)
     if (!stockMeta) return stock
-
     let changePct = 0
-
     if (!isNoiseTick && newsEvent) {
-      // Full news impact on minute advance
       const sectorImpact = newsEvent.impact[stockMeta.sector] ?? 0
-      const jitter = (Math.random() - 0.5) * 1.2   // ±0.6% noise
+      const jitter = (Math.random() - 0.5) * 1.2
       changePct = (sectorImpact + jitter) / 100
     } else {
-      // 10-second noise tick — high volatility to simulate live market
-      const noise = (Math.random() - 0.5) * 1.6    // ±0.8% per tick = very lively
+      const noise = (Math.random() - 0.5) * 1.6
       changePct = noise / 100
     }
-
     const newPrice = Math.max(stock.price * (1 + changePct), 1)
     return { ...stock, price: Math.round(newPrice * 100) / 100 }
   })
@@ -68,89 +61,95 @@ export async function POST(req: NextRequest) {
     }))
     await supabase.from('stock_prices').upsert(initialPrices, { onConflict: 'symbol' })
 
-    const phaseEnds = new Date(Date.now() + TRADING_MINUTES * 60 * 1000)
+    // phase_ends_at = exactly 60 seconds from now (1 minute of trading)
+    const phaseEnds = new Date(Date.now() + 60 * 1000)
     await supabase.from('game_state').update({
       status: 'trading',
       current_day: 1,
       current_minute: 1,
       phase_ends_at: phaseEnds.toISOString(),
       started_at: new Date().toISOString(),
-      session_id: Date.now().toString(),   // kick existing participants
+      session_id: Date.now().toString(),
     }).eq('id', 1)
 
     return NextResponse.json({ success: true, message: 'Game started! Day 1 · Minute 1' })
   }
 
-  // ── NEXT MINUTE (called by admin every 60s) ───────────
-  if (action === 'next_minute') {
-    if (gs.status !== 'trading') {
-      return NextResponse.json({ error: 'Game is not in trading phase' })
-    }
-
-    const { data: currentPrices } = await supabase
-      .from('stock_prices').select('symbol, price')
-
-    // Apply news impact for the minute that just ended
-    if (currentPrices) {
-      const updated = applyPriceChanges(currentPrices, gs.current_day, gs.current_minute, false)
-      await updatePricesInDb(updated)
-    }
-
-    const nextMinute = gs.current_minute + 1
-
-    if (nextMinute > TRADING_MINUTES) {
-      // End of trading day
-      if (gs.current_day >= TOTAL_DAYS) {
-        await supabase.from('game_state').update({
-          status: 'finished', phase_ends_at: null,
-        }).eq('id', 1)
-        return NextResponse.json({ success: true, message: '🏁 Game finished!' })
+  // ── ADVANCE (called automatically every 60s by admin panel) ──
+  // This is the single action that drives the whole game forward
+  if (action === 'advance') {
+    // Only advance if timer has actually expired — prevents double-calls
+    if (gs.phase_ends_at) {
+      const endsAt = new Date(gs.phase_ends_at).getTime()
+      const now = Date.now()
+      if (endsAt > now + 2000) {
+        // Timer hasn't expired yet, ignore this call
+        return NextResponse.json({ success: true, message: 'Timer still running' })
       }
-      // Start break
-      const phaseEnds = new Date(Date.now() + BREAK_MINUTES * 60 * 1000)
-      await supabase.from('game_state').update({
-        status: 'break', phase_ends_at: phaseEnds.toISOString(),
-      }).eq('id', 1)
-      return NextResponse.json({ success: true, message: `☕ Break — Day ${gs.current_day} complete` })
     }
 
-    // Advance minute
-    const phaseEnds = new Date(Date.now() + 60 * 1000)
-    await supabase.from('game_state').update({
-      current_minute: nextMinute,
-      phase_ends_at: phaseEnds.toISOString(),
-    }).eq('id', 1)
-    return NextResponse.json({ success: true, message: `Day ${gs.current_day} · Min ${nextMinute}` })
+    if (gs.status === 'trading') {
+      // Apply news impact for the minute that just completed
+      const { data: currentPrices } = await supabase.from('stock_prices').select('symbol, price')
+      if (currentPrices) {
+        const updated = applyPriceChanges(currentPrices, gs.current_day, gs.current_minute, false)
+        await updatePricesInDb(updated)
+      }
+
+      const nextMinute = gs.current_minute + 1
+
+      if (nextMinute > TRADING_MINUTES) {
+        // Trading day done
+        if (gs.current_day >= TOTAL_DAYS) {
+          await supabase.from('game_state').update({
+            status: 'finished', phase_ends_at: null,
+          }).eq('id', 1)
+          return NextResponse.json({ success: true, message: '🏁 Game finished!' })
+        }
+        // Start 2 min break
+        const phaseEnds = new Date(Date.now() + BREAK_MINUTES * 60 * 1000)
+        await supabase.from('game_state').update({
+          status: 'break', phase_ends_at: phaseEnds.toISOString(),
+        }).eq('id', 1)
+        return NextResponse.json({ success: true, message: `☕ Break — Day ${gs.current_day} complete` })
+      }
+
+      // Next trading minute — 60 seconds
+      const phaseEnds = new Date(Date.now() + 60 * 1000)
+      await supabase.from('game_state').update({
+        current_minute: nextMinute,
+        phase_ends_at: phaseEnds.toISOString(),
+      }).eq('id', 1)
+      return NextResponse.json({ success: true, message: `Day ${gs.current_day} · Min ${nextMinute}` })
+    }
+
+    if (gs.status === 'break') {
+      // Break over — start next trading day, minute 1 — 60 seconds
+      const nextDay = gs.current_day + 1
+      const phaseEnds = new Date(Date.now() + 60 * 1000)
+      await supabase.from('game_state').update({
+        status: 'trading',
+        current_day: nextDay,
+        current_minute: 1,
+        phase_ends_at: phaseEnds.toISOString(),
+      }).eq('id', 1)
+      return NextResponse.json({ success: true, message: `🔔 Day ${nextDay} started!` })
+    }
+
+    return NextResponse.json({ success: true, message: 'Nothing to advance' })
   }
 
-  // ── NOISE TICK (called every 10s by admin panel auto-advance) ──
+  // ── NOISE TICK (every 5s during trading for live price feel) ──
   if (action === 'price_tick') {
     if (gs.status !== 'trading') {
       return NextResponse.json({ success: true, message: 'Not trading' })
     }
-    const { data: currentPrices } = await supabase
-      .from('stock_prices').select('symbol, price')
+    const { data: currentPrices } = await supabase.from('stock_prices').select('symbol, price')
     if (currentPrices) {
       const updated = applyPriceChanges(currentPrices, gs.current_day, gs.current_minute, true)
       await updatePricesInDb(updated)
     }
     return NextResponse.json({ success: true, message: 'Prices updated' })
-  }
-
-  // ── NEXT DAY (after break) ────────────────────────────
-  if (action === 'next_day') {
-    if (gs.status !== 'break') {
-      return NextResponse.json({ error: 'Game is not in break phase' })
-    }
-    const nextDay = gs.current_day + 1
-    const phaseEnds = new Date(Date.now() + TRADING_MINUTES * 60 * 1000)
-    await supabase.from('game_state').update({
-      status: 'trading',
-      current_day: nextDay,
-      current_minute: 1,
-      phase_ends_at: phaseEnds.toISOString(),
-    }).eq('id', 1)
-    return NextResponse.json({ success: true, message: `🔔 Day ${nextDay} started!` })
   }
 
   // ── RESET ─────────────────────────────────────────────
@@ -165,9 +164,9 @@ export async function POST(req: NextRequest) {
       current_minute: 0,
       phase_ends_at: null,
       started_at: null,
-      session_id: Date.now().toString(),   // bump session → kicks all participants
+      session_id: Date.now().toString(),
     }).eq('id', 1)
-    return NextResponse.json({ success: true, message: 'Game reset! All participants kicked.' })
+    return NextResponse.json({ success: true, message: 'Game reset!' })
   }
 
   return NextResponse.json({ error: 'Unknown action' }, { status: 400 })
