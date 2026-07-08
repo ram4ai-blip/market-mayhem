@@ -3,8 +3,6 @@ import { useState, useEffect, useRef } from 'react'
 import { supabase } from '@/lib/supabase'
 
 const ADMIN_PWD = 'marketadmin2024'
-const TRADING_MINUTES = 6
-const BREAK_MINUTES = 2
 
 export default function AdminPage() {
   const [authed, setAuthed] = useState(false)
@@ -20,20 +18,26 @@ export default function AdminPage() {
   const priceTickRef = useRef<any>(null)
   const minuteTickRef = useRef<any>(null)
   const autoAdvanceRef = useRef(false)
+  const gameStateRef = useRef<any>(null)  // always-current ref for intervals
+
+  // Keep ref in sync with state
+  useEffect(() => { gameStateRef.current = gameState }, [gameState])
 
   useEffect(() => {
     if (!authed) return
     fetchAll()
+    // Poll every 3s so admin view stays fresh too
+    const poll = setInterval(() => fetchAll(), 3000)
     const channel = supabase.channel('admin-rt')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'game_state' }, fetchAll)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' }, fetchAll)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'stock_prices' }, fetchAll)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'holdings' }, fetchAll)
       .subscribe()
-    return () => { supabase.removeChannel(channel) }
+    return () => { clearInterval(poll); supabase.removeChannel(channel) }
   }, [authed])
 
-  // Countdown timer
+  // Countdown timer — runs off phase_ends_at from DB, always in sync
   useEffect(() => {
     if (timerRef.current) clearInterval(timerRef.current)
     if (gameState?.phase_ends_at && (gameState.status === 'trading' || gameState.status === 'break')) {
@@ -47,20 +51,24 @@ export default function AdminPage() {
     return () => { if (timerRef.current) clearInterval(timerRef.current) }
   }, [gameState?.phase_ends_at, gameState?.status])
 
-  // Auto-advance: price tick every 10s + minute advance every 60s
+  // Auto-advance intervals — use ref so they always see latest game state
   useEffect(() => {
     if (priceTickRef.current) clearInterval(priceTickRef.current)
     if (minuteTickRef.current) clearInterval(minuteTickRef.current)
 
     if (gameState?.status === 'trading' && autoAdvanceRef.current) {
-      // Price noise every 10 seconds
+      // Price noise every 10s
       priceTickRef.current = setInterval(() => {
-        callAdmin('price_tick', true)
+        if (gameStateRef.current?.status === 'trading') {
+          callAdmin('price_tick', true)
+        }
       }, 10000)
 
-      // Minute advance every 60 seconds
+      // Minute advance every 60s
       minuteTickRef.current = setInterval(() => {
-        callAdmin('next_minute', true)
+        if (gameStateRef.current?.status === 'trading') {
+          callAdmin('next_minute', true)
+        }
       }, 60000)
     }
 
@@ -73,7 +81,7 @@ export default function AdminPage() {
   async function fetchAll() {
     const [gsRes, teamsRes, pricesRes, holdingsRes] = await Promise.all([
       supabase.from('game_state').select('*').eq('id', 1).single(),
-      supabase.from('teams').select('*').order('cash', { ascending: false }),
+      supabase.from('teams').select('*'),
       supabase.from('stock_prices').select('*').order('symbol'),
       supabase.from('holdings').select('*'),
     ])
@@ -121,22 +129,15 @@ export default function AdminPage() {
     await callAdmin('reset')
   }
 
-  function getTeamTotal(team: any) {
-    const portfolioValue = holdings
-      .filter(h => h.team_name === team.name && h.quantity > 0)
-      .reduce((sum, h) => {
-        const price = prices.find(p => p.symbol === h.symbol)?.price || 0
-        return sum + h.quantity * price
-      }, 0)
-    return team.cash + portfolioValue
-  }
-
-  function getReturn(team: any) {
-    const total = getTeamTotal(team)
-    return ((total - 1000000) / 1000000) * 100
-  }
-
-  const sortedTeams = [...teams].sort((a, b) => getTeamTotal(b) - getTeamTotal(a))
+  // Compute leaderboard with portfolio values
+  const leaderboard = teams.map(t => {
+    const portfolioVal = holdings
+      .filter(h => h.team_name === t.name && h.quantity > 0)
+      .reduce((sum, h) => sum + h.quantity * (prices.find(p => p.symbol === h.symbol)?.price || 0), 0)
+    const total = t.cash + portfolioVal
+    const ret = ((total - 1000000) / 1000000) * 100
+    return { ...t, portfolioVal, total, ret }
+  }).sort((a, b) => b.total - a.total)
 
   const statusColor = gameState?.status === 'trading' ? '#00e676'
     : gameState?.status === 'break' ? '#ffab00'
@@ -145,6 +146,7 @@ export default function AdminPage() {
   const timerColor = timeLeft !== null && timeLeft <= 20 ? '#ff1744'
     : timeLeft !== null && timeLeft <= 40 ? '#ffab00' : '#00e676'
 
+  // ── LOGIN ──────────────────────────────────────────────
   if (!authed) return (
     <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0a0f' }}>
       <div style={{ background: '#111118', border: '1px solid #2a2a3a', borderRadius: '16px', padding: '40px', width: '360px' }}>
@@ -163,6 +165,7 @@ export default function AdminPage() {
     </div>
   )
 
+  // ── MAIN ──────────────────────────────────────────────
   return (
     <div style={{ minHeight: '100vh', background: '#0a0a0f', padding: '20px', fontFamily: 'Inter, sans-serif', color: '#e8e8f0' }}>
       <div style={{ maxWidth: '1300px', margin: '0 auto' }}>
@@ -192,18 +195,14 @@ export default function AdminPage() {
 
         <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gap: '20px' }}>
 
-          {/* LEFT COLUMN - Controls */}
+          {/* LEFT — Controls */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
 
-            {/* Game Controls */}
             <div style={{ background: '#111118', border: '1px solid #2a2a3a', borderRadius: '12px', padding: '20px' }}>
               <p style={{ fontSize: '10px', color: '#6b6b80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '16px' }}>Game Controls</p>
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '16px' }}>
-                {[
-                  { label: 'Day', value: `${gameState?.current_day ?? '-'}/5` },
-                  { label: 'Minute', value: `${gameState?.current_minute ?? '-'}/6` },
-                ].map(({ label, value }) => (
+                {[{ label: 'Day', value: `${gameState?.current_day ?? '-'}/5` }, { label: 'Minute', value: `${gameState?.current_minute ?? '-'}/6` }].map(({ label, value }) => (
                   <div key={label} style={{ background: '#1a1a24', borderRadius: '8px', padding: '10px', textAlign: 'center' }}>
                     <p style={{ fontSize: '10px', color: '#6b6b80' }}>{label}</p>
                     <p style={{ fontSize: '20px', fontWeight: 700, fontFamily: 'monospace' }}>{value}</p>
@@ -223,21 +222,18 @@ export default function AdminPage() {
                   {loading ? 'Starting...' : '▶ Start Simulation'}
                 </button>
               )}
-
               {gameState?.status === 'trading' && (
                 <button onClick={() => callAdmin('next_minute')} disabled={loading}
                   style={{ width: '100%', padding: '14px', background: '#448aff', color: '#fff', border: 'none', borderRadius: '10px', fontSize: '15px', fontWeight: 700, cursor: 'pointer', marginBottom: '8px' }}>
                   {loading ? '...' : '⏭ Next Minute'}
                 </button>
               )}
-
               {gameState?.status === 'break' && (
                 <button onClick={handleNextDay} disabled={loading}
                   style={{ width: '100%', padding: '14px', background: '#ffab00', color: '#000', border: 'none', borderRadius: '10px', fontSize: '15px', fontWeight: 700, cursor: 'pointer', marginBottom: '8px' }}>
                   {loading ? '...' : '🌅 Start Next Day'}
                 </button>
               )}
-
               {gameState?.status === 'finished' && (
                 <div style={{ padding: '14px', background: '#1a1a24', borderRadius: '10px', textAlign: 'center', color: '#00e676', fontWeight: 700, marginBottom: '8px', fontSize: '15px' }}>
                   🏆 Simulation Complete!
@@ -250,7 +246,7 @@ export default function AdminPage() {
               </button>
             </div>
 
-            {/* Flow Guide */}
+            {/* Session Flow */}
             <div style={{ background: '#111118', border: '1px solid #2a2a3a', borderRadius: '12px', padding: '20px' }}>
               <p style={{ fontSize: '10px', color: '#6b6b80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '12px' }}>Session Flow</p>
               {[
@@ -258,6 +254,7 @@ export default function AdminPage() {
                 { label: 'Trading per Day', value: '6 min' },
                 { label: 'Revision Break', value: '2 min' },
                 { label: 'Trading Days', value: '5 days' },
+                { label: 'Price Updates', value: 'Every 10s' },
               ].map(({ label, value }) => (
                 <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0', borderBottom: '1px solid #1a1a24', fontSize: '12px' }}>
                   <span style={{ color: '#6b6b80' }}>{label}</span>
@@ -266,7 +263,7 @@ export default function AdminPage() {
               ))}
             </div>
 
-            {/* Teams Joined */}
+            {/* Teams */}
             <div style={{ background: '#111118', border: '1px solid #2a2a3a', borderRadius: '12px', padding: '20px' }}>
               <p style={{ fontSize: '10px', color: '#6b6b80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '12px' }}>Teams ({teams.length}/7)</p>
               {teams.length === 0
@@ -280,51 +277,42 @@ export default function AdminPage() {
             </div>
           </div>
 
-          {/* RIGHT COLUMN */}
+          {/* RIGHT — Leaderboard + Prices */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
 
-            {/* Leaderboard */}
             <div style={{ background: '#111118', border: '1px solid #2a2a3a', borderRadius: '12px', padding: '20px' }}>
               <p style={{ fontSize: '10px', color: '#6b6b80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '16px' }}>🏆 Live Leaderboard</p>
-              {sortedTeams.length === 0
+              {leaderboard.length === 0
                 ? <p style={{ color: '#6b6b80', fontSize: '13px' }}>No teams yet</p>
                 : (
                   <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                     <thead>
                       <tr style={{ borderBottom: '1px solid #2a2a3a' }}>
-                        {['#', 'Team', 'Cash', 'Portfolio', 'Total', 'Return'].map(h => (
+                        {['#', 'Team', 'Cash', 'Portfolio', 'Total', 'Return %'].map(h => (
                           <th key={h} style={{ padding: '8px 10px', textAlign: h === '#' ? 'center' : 'right', fontSize: '10px', color: '#6b6b80', letterSpacing: '1px', fontWeight: 600 }}>{h}</th>
                         ))}
                       </tr>
                     </thead>
                     <tbody>
-                      {sortedTeams.map((t, i) => {
-                        const portfolioVal = holdings
-                          .filter(h => h.team_name === t.name && h.quantity > 0)
-                          .reduce((sum, h) => sum + h.quantity * (prices.find(p => p.symbol === h.symbol)?.price || 0), 0)
-                        const total = t.cash + portfolioVal
-                        const ret = ((total - 1000000) / 1000000) * 100
-                        return (
-                          <tr key={t.name} style={{ borderBottom: '1px solid #1a1a24' }}>
-                            <td style={{ padding: '10px', textAlign: 'center', fontSize: '13px', color: i === 0 ? '#ffab00' : '#6b6b80', fontWeight: i === 0 ? 700 : 400 }}>
-                              {i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : i + 1}
-                            </td>
-                            <td style={{ padding: '10px', textAlign: 'right', fontSize: '14px', fontWeight: 600 }}>{t.name}</td>
-                            <td style={{ padding: '10px', textAlign: 'right', fontSize: '12px', fontFamily: 'monospace', color: '#6b6b80' }}>₹{(t.cash / 100000).toFixed(2)}L</td>
-                            <td style={{ padding: '10px', textAlign: 'right', fontSize: '12px', fontFamily: 'monospace', color: '#448aff' }}>₹{(portfolioVal / 100000).toFixed(2)}L</td>
-                            <td style={{ padding: '10px', textAlign: 'right', fontSize: '13px', fontFamily: 'monospace', fontWeight: 700 }}>₹{(total / 100000).toFixed(2)}L</td>
-                            <td style={{ padding: '10px', textAlign: 'right', fontSize: '13px', fontFamily: 'monospace', fontWeight: 700, color: ret >= 0 ? '#00e676' : '#ff1744' }}>
-                              {ret >= 0 ? '+' : ''}{ret.toFixed(2)}%
-                            </td>
-                          </tr>
-                        )
-                      })}
+                      {leaderboard.map((t, i) => (
+                        <tr key={t.name} style={{ borderBottom: '1px solid #1a1a24' }}>
+                          <td style={{ padding: '10px', textAlign: 'center', fontSize: '14px' }}>
+                            {i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : <span style={{ color: '#6b6b80' }}>{i + 1}</span>}
+                          </td>
+                          <td style={{ padding: '10px', textAlign: 'right', fontSize: '14px', fontWeight: 600 }}>{t.name}</td>
+                          <td style={{ padding: '10px', textAlign: 'right', fontSize: '12px', fontFamily: 'monospace', color: '#6b6b80' }}>₹{(t.cash / 100000).toFixed(2)}L</td>
+                          <td style={{ padding: '10px', textAlign: 'right', fontSize: '12px', fontFamily: 'monospace', color: '#448aff' }}>₹{(t.portfolioVal / 100000).toFixed(2)}L</td>
+                          <td style={{ padding: '10px', textAlign: 'right', fontSize: '13px', fontFamily: 'monospace', fontWeight: 700 }}>₹{(t.total / 100000).toFixed(2)}L</td>
+                          <td style={{ padding: '10px', textAlign: 'right', fontSize: '14px', fontFamily: 'monospace', fontWeight: 800, color: t.ret >= 0 ? '#00e676' : '#ff1744' }}>
+                            {t.ret >= 0 ? '+' : ''}{t.ret.toFixed(2)}%
+                          </td>
+                        </tr>
+                      ))}
                     </tbody>
                   </table>
                 )}
             </div>
 
-            {/* Live Prices */}
             {prices.length > 0 && (
               <div style={{ background: '#111118', border: '1px solid #2a2a3a', borderRadius: '12px', padding: '20px' }}>
                 <p style={{ fontSize: '10px', color: '#6b6b80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '16px' }}>📈 Live Stock Prices</p>
