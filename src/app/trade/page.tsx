@@ -327,19 +327,20 @@ export default function TradePage() {
                 <div style={{ flex: 1, height: '1px', background: '#2a2a3a' }} />
               </div>
 
-              {prices.filter(p => STOCKS.find(s => s.symbol === p.symbol)?.sector === sector).map(p => {
+              {STOCKS.filter(s => s.sector === sector).map(s => {
+                const p = prices.find(pr => pr.symbol === s.symbol) || { price: s.basePrice, base_price: s.basePrice }
                 const change = ((p.price - p.base_price) / p.base_price) * 100
-                const holding = holdings.find(h => h.symbol === p.symbol)
+                const holding = holdings.find(h => h.symbol === s.symbol)
                 const heldQty = holding?.quantity || 0
-                const currentQty = getQty(p.symbol)
-                const delta = priceDelta[p.symbol]
+                const currentQty = getQty(s.symbol)
+                const delta = priceDelta[s.symbol]
                 const canAfford = (team?.cash || 0) >= p.price * currentQty
                 const canSell = heldQty >= currentQty
-                const msg = tradeMsg && tradeMsg.symbol === p.symbol ? tradeMsg.msg : null
-                const loadingThis = tradeLoading === p.symbol + 'buy' || tradeLoading === p.symbol + 'sell'
+                const msg = tradeMsg && tradeMsg.symbol === s.symbol ? tradeMsg.msg : null
+                const loadingThis = tradeLoading === s.symbol + 'buy' || tradeLoading === s.symbol + 'sell'
 
                 return (
-                  <div key={p.symbol} style={{
+                  <div key={s.symbol} style={{
                     display: 'grid',
                     gridTemplateColumns: '190px 100px 80px 70px 130px 170px',
                     gap: '8px', padding: '8px 12px', borderRadius: '8px', marginBottom: '3px',
@@ -351,8 +352,8 @@ export default function TradePage() {
 
                     {/* Stock name */}
                     <div>
-                      <span style={{ fontSize: '13px', fontWeight: 700, fontFamily: 'monospace' }}>{p.symbol}</span>
-                      <span style={{ fontSize: '11px', color: '#6b6b80', marginLeft: '6px' }}>{p.name.split(' ').slice(0, 2).join(' ')}</span>
+                      <span style={{ fontSize: '13px', fontWeight: 700, fontFamily: 'monospace' }}>{s.symbol}</span>
+                      <span style={{ fontSize: '11px', color: '#6b6b80', marginLeft: '6px' }}>{s.name.split(' ').slice(0, 2).join(' ')}</span>
                       {msg && <div style={{ fontSize: '11px', marginTop: '2px', color: msg.startsWith('✅') ? '#00e676' : '#ff1744' }}>{msg}</div>}
                     </div>
 
@@ -380,7 +381,7 @@ export default function TradePage() {
                     {/* Qty presets */}
                     <div style={{ display: 'flex', gap: '3px', justifyContent: 'flex-end' }}>
                       {QTY_PRESETS.map(q => (
-                        <button key={q} onClick={() => setQty(prev => ({ ...prev, [p.symbol]: q }))}
+                        <button key={q} onClick={() => setQty(prev => ({ ...prev, [s.symbol]: q }))}
                           style={{ padding: '4px 7px', fontSize: '11px', fontWeight: currentQty === q ? 700 : 400, borderRadius: '4px', border: 'none', cursor: isBreak ? 'default' : 'pointer', background: currentQty === q ? '#448aff' : '#1a1a24', color: currentQty === q ? '#fff' : '#6b6b80', transition: 'all 0.1s' }}>
                           {q}
                         </button>
@@ -393,12 +394,12 @@ export default function TradePage() {
                         <span style={{ fontSize: '11px', color: '#ffab00', textAlign: 'right', width: '100%' }}>Market closed</span>
                       ) : (
                         <>
-                          <button onClick={() => executeTrade(p.symbol, 'buy')}
+                          <button onClick={() => executeTrade(s.symbol, 'buy')}
                             disabled={loadingThis || !canAfford}
                             style={{ flex: 1, padding: '6px 0', fontSize: '12px', fontWeight: 700, borderRadius: '6px', border: 'none', cursor: !canAfford ? 'not-allowed' : 'pointer', background: !canAfford ? '#2a2a3a' : '#00e676', color: !canAfford ? '#6b6b80' : '#000', transition: 'all 0.15s' }}>
                             {loadingThis ? '…' : 'BUY'}
                           </button>
-                          <button onClick={() => executeTrade(p.symbol, 'sell')}
+                          <button onClick={() => executeTrade(s.symbol, 'sell')}
                             disabled={loadingThis || !canSell}
                             style={{ flex: 1, padding: '6px 0', fontSize: '12px', fontWeight: 700, borderRadius: '6px', border: 'none', cursor: !canSell ? 'not-allowed' : 'pointer', background: !canSell ? '#2a2a3a' : '#ff1744', color: !canSell ? '#6b6b80' : '#fff', transition: 'all 0.15s' }}>
                             {loadingThis ? '…' : 'SELL'}
