@@ -1,5 +1,5 @@
 'use client'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { supabase } from '@/lib/supabase'
 
 const ADMIN_PWD = 'marketadmin2024'
@@ -12,6 +12,16 @@ export default function AdminPage() {
   const [prices, setPrices] = useState<any[]>([])
   const [msg, setMsg] = useState('')
   const [loading, setLoading] = useState(false)
+  const [timeLeft, setTimeLeft] = useState(0)
+  const [autoAdvance, setAutoAdvance] = useState(false)
+
+  const gameStateRef = useRef<any>(null)
+  const autoAdvanceRef = useRef(false)
+  const timeLeftRef = useRef(0)
+
+  useEffect(() => { gameStateRef.current = gameState }, [gameState])
+  useEffect(() => { autoAdvanceRef.current = autoAdvance }, [autoAdvance])
+  useEffect(() => { timeLeftRef.current = timeLeft }, [timeLeft])
 
   useEffect(() => {
     if (!authed) return
@@ -22,6 +32,58 @@ export default function AdminPage() {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'stock_prices' }, fetchAll)
       .subscribe()
     return () => { supabase.removeChannel(channel) }
+  }, [authed])
+
+  // Countdown timer
+  useEffect(() => {
+    if (!gameState?.phase_ends_at) return
+    const interval = setInterval(() => {
+      const left = Math.max(0, Math.floor((new Date(gameState.phase_ends_at).getTime() - Date.now()) / 1000))
+      setTimeLeft(left)
+    }, 500)
+    return () => clearInterval(interval)
+  }, [gameState?.phase_ends_at])
+
+  // Price tick every 5 seconds + auto advance when timer hits 0
+  useEffect(() => {
+    if (!authed) return
+
+    // Tick prices every 5 seconds during trading
+    const tickInterval = setInterval(async () => {
+      const gs = gameStateRef.current
+      if (!gs || gs.status !== 'trading') return
+      await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'tick', password: ADMIN_PWD })
+      })
+    }, 5000)
+
+    // Auto advance when timer hits 0
+    const advanceInterval = setInterval(async () => {
+      if (!autoAdvanceRef.current) return
+      const gs = gameStateRef.current
+      if (!gs || gs.status === 'waiting' || gs.status === 'finished') return
+      if (timeLeftRef.current > 0) return
+
+      if (gs.status === 'trading') {
+        await fetch('/api/admin', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'next_minute', password: ADMIN_PWD })
+        })
+        fetchAll()
+      } else if (gs.status === 'break') {
+        await fetch('/api/admin', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'next_day', password: ADMIN_PWD })
+        })
+        fetchAll()
+      }
+    }, 1000)
+
+    return () => { clearInterval(tickInterval); clearInterval(advanceInterval) }
   }, [authed])
 
   async function fetchAll() {
@@ -103,6 +165,44 @@ export default function AdminPage() {
                   <p style={{ fontSize: '11px', color: 'var(--text-dim)' }}>Minute</p>
                   <p style={{ fontSize: '24px', fontWeight: 700, fontFamily: 'var(--mono)' }}>{gameState?.current_minute ?? '-'}/6</p>
                 </div>
+              </div>
+
+              {/* Timer */}
+              {gameState?.phase_ends_at && (
+                <div style={{ textAlign: 'center', marginBottom: '16px', padding: '12px', background: 'var(--surface2)', borderRadius: '8px' }}>
+                  <p style={{ fontSize: '11px', color: 'var(--text-dim)', marginBottom: '4px' }}>
+                    {gameState.status === 'trading' ? 'MINUTE ENDS IN' : 'BREAK ENDS IN'}
+                  </p>
+                  <p style={{ fontSize: '32px', fontWeight: 700, fontFamily: 'var(--mono)', color: gameState.status === 'trading' ? 'var(--green)' : 'var(--amber)' }}>
+                    {Math.floor(timeLeft / 60)}:{String(timeLeft % 60).padStart(2, '0')}
+                  </p>
+                </div>
+              )}
+
+              {/* Price tick indicator */}
+              {gameState?.status === 'trading' && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px', padding: '8px 12px', background: 'rgba(0,230,118,0.08)', borderRadius: '8px', border: '1px solid rgba(0,230,118,0.2)' }}>
+                  <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: 'var(--green)', display: 'inline-block', animation: 'pulse 1s infinite' }} />
+                  <span style={{ fontSize: '12px', color: 'var(--green)' }}>Prices updating every 5s</span>
+                </div>
+              )}
+
+              {/* Auto Advance Toggle */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px', padding: '10px 14px', background: 'var(--surface2)', borderRadius: '8px' }}>
+                <div>
+                  <p style={{ fontSize: '13px', fontWeight: 500 }}>Auto Advance</p>
+                  <p style={{ fontSize: '11px', color: 'var(--text-dim)' }}>Auto next minute/day</p>
+                </div>
+                <button onClick={() => setAutoAdvance(!autoAdvance)} style={{
+                  width: '44px', height: '24px', borderRadius: '12px', border: 'none',
+                  background: autoAdvance ? 'var(--green)' : 'var(--border)',
+                  position: 'relative', cursor: 'pointer', transition: 'background 0.2s', flexShrink: 0
+                }}>
+                  <span style={{
+                    position: 'absolute', top: '2px', left: autoAdvance ? '22px' : '2px',
+                    width: '20px', height: '20px', borderRadius: '50%', background: '#fff', transition: 'left 0.2s'
+                  }} />
+                </button>
               </div>
 
               {msg && <div style={{ marginBottom: '12px', padding: '10px 14px', background: 'var(--surface2)', borderRadius: '8px', fontSize: '13px', color: msg.startsWith('✅') ? 'var(--green)' : 'var(--red)' }}>{msg}</div>}
@@ -198,6 +298,9 @@ export default function AdminPage() {
           </div>
         </div>
       </div>
+      <style>{`
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+      `}</style>
     </div>
   )
 }
