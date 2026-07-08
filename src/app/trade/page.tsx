@@ -66,7 +66,7 @@ export default function TradePage() {
     const [gsRes, teamRes, pricesRes, holdingsRes, teamsRes] = await Promise.all([
       supabase.from('game_state').select('*').eq('id', 1).single(),
       supabase.from('teams').select('*').eq('name', t).single(),
-      supabase.from('stock_prices').select('*'),
+      supabase.from('stock_prices').select('*').order('symbol', { ascending: true }),
       supabase.from('holdings').select('*').eq('team_name', t),
       supabase.from('teams').select('*'),
     ])
