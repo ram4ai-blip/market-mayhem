@@ -313,9 +313,9 @@ export default function TradePage() {
         <div style={{ flex: 1, overflow: 'auto', padding: '16px 20px' }}>
 
           {/* Column headers */}
-          <div style={{ display: 'grid', gridTemplateColumns: '190px 100px 80px 70px 130px 170px', gap: '8px', padding: '6px 12px', marginBottom: '4px' }}>
-            {['Stock', 'Price', 'Change', 'Holding', 'Quantity', isBreak ? 'Status' : 'Trade'].map(h => (
-              <span key={h} style={{ fontSize: '10px', color: '#6b6b80', textTransform: 'uppercase', letterSpacing: '1px', textAlign: h === 'Stock' ? 'left' : 'right' }}>{h}</span>
+          <div style={{ display: 'grid', gridTemplateColumns: '190px 100px 80px 80px 90px 130px 170px', gap: '8px', padding: '6px 12px', marginBottom: '4px' }}>
+            {['Stock', 'Price', 'Change', 'Holding', '% G/L', 'Quantity', isBreak ? 'Status' : 'Trade'].map(h => (
+              <span key={h} style={{ fontSize: '10px', color: (h === 'Holding' || h === '% G/L') ? '#448aff' : '#6b6b80', textTransform: 'uppercase', letterSpacing: '1px', textAlign: h === 'Stock' ? 'left' : 'right', fontWeight: (h === 'Holding' || h === '% G/L') ? 700 : 400 }}>{h}</span>
             ))}
           </div>
 
@@ -339,14 +339,18 @@ export default function TradePage() {
                 const msg = tradeMsg && tradeMsg.symbol === s.symbol ? tradeMsg.msg : null
                 const loadingThis = tradeLoading === s.symbol + 'buy' || tradeLoading === s.symbol + 'sell'
 
+                const holdingPct = heldQty > 0 && holding?.avg_buy_price
+                  ? ((p.price - holding.avg_buy_price) / holding.avg_buy_price) * 100
+                  : null
+
                 return (
                   <div key={s.symbol} style={{
                     display: 'grid',
-                    gridTemplateColumns: '190px 100px 80px 70px 130px 170px',
+                    gridTemplateColumns: '190px 100px 80px 80px 90px 130px 170px',
                     gap: '8px', padding: '8px 12px', borderRadius: '8px', marginBottom: '3px',
                     alignItems: 'center',
-                    background: delta === 'up' ? 'rgba(0,230,118,0.07)' : delta === 'down' ? 'rgba(255,23,68,0.07)' : '#111118',
-                    border: `1px solid ${delta === 'up' ? 'rgba(0,230,118,0.25)' : delta === 'down' ? 'rgba(255,23,68,0.25)' : '#2a2a3a'}`,
+                    background: delta === 'up' ? 'rgba(0,230,118,0.07)' : delta === 'down' ? 'rgba(255,23,68,0.07)' : heldQty > 0 ? 'rgba(68,138,255,0.04)' : '#111118',
+                    border: `1px solid ${delta === 'up' ? 'rgba(0,230,118,0.25)' : delta === 'down' ? 'rgba(255,23,68,0.25)' : heldQty > 0 ? 'rgba(68,138,255,0.3)' : '#2a2a3a'}`,
                     transition: 'background 0.4s, border-color 0.4s',
                   }}>
 
@@ -371,10 +375,19 @@ export default function TradePage() {
                       </p>
                     </div>
 
-                    {/* Holding */}
+                    {/* Holding — highlighted */}
                     <div style={{ textAlign: 'right' }}>
                       {heldQty > 0
-                        ? <span style={{ fontSize: '12px', fontWeight: 700, color: '#448aff', fontFamily: 'monospace', background: 'rgba(68,138,255,0.12)', padding: '2px 8px', borderRadius: '4px' }}>{heldQty}</span>
+                        ? <span style={{ fontSize: '12px', fontWeight: 800, color: '#fff', fontFamily: 'monospace', background: '#448aff', padding: '3px 10px', borderRadius: '6px', boxShadow: '0 0 8px rgba(68,138,255,0.4)' }}>{heldQty}</span>
+                        : <span style={{ fontSize: '12px', color: '#2a2a3a' }}>—</span>}
+                    </div>
+
+                    {/* % Gain / Loss */}
+                    <div style={{ textAlign: 'right' }}>
+                      {holdingPct !== null
+                        ? <span style={{ fontSize: '12px', fontWeight: 700, fontFamily: 'monospace', color: holdingPct >= 0 ? '#00e676' : '#ff1744', background: holdingPct >= 0 ? 'rgba(0,230,118,0.1)' : 'rgba(255,23,68,0.1)', padding: '3px 8px', borderRadius: '6px' }}>
+                          {holdingPct >= 0 ? '+' : ''}{holdingPct.toFixed(2)}%
+                        </span>
                         : <span style={{ fontSize: '12px', color: '#2a2a3a' }}>—</span>}
                     </div>
 
