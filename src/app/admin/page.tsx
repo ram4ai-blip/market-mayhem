@@ -131,7 +131,7 @@ export default function AdminPage() {
           style={{ width: '100%', padding: '13px', background: '#00e676', color: '#000', border: 'none', borderRadius: '8px', fontWeight: 700, fontSize: '15px', cursor: 'pointer' }}>
           Login →
         </button>
-        <p style={{ fontSize: '12px', color: '#6b6b80', marginTop: '12px', textAlign: 'center' }}>Default: marketadmin2024</p>
+        <p style={{ fontSize: '12px', color: '#6b6b80', marginTop: '12px', textAlign: 'center' }}>Contact admin for password</p>
       </div>
     </div>
   )
