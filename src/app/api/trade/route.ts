@@ -29,19 +29,19 @@ export async function POST(req: NextRequest) {
       .single()
 
     if (!team) return NextResponse.json({ error: 'Team not found' })
-    if (team.cash < totalCost) return NextResponse.json({ error: 'Insufficient cash' })
 
     // Atomic update — only succeeds if cash >= totalCost right now in DB
+    // No pre-check error shown — BUY button greys out naturally via UI
     const { data: updated } = await supabase
       .from('teams')
       .update({ cash: team.cash - totalCost })
       .eq('name', teamName)
-      .gte('cash', totalCost)   // ← THE FIX: conditional write blocks race condition
+      .gte('cash', totalCost)
       .select('cash')
       .single()
 
-    // If updated is null, another request already spent the cash — reject
-    if (!updated) return NextResponse.json({ error: 'Insufficient cash' })
+    // Silent fail — no error message, UI handles it
+    if (!updated) return NextResponse.json({ success: false })
 
     const { data: existing } = await supabase
       .from('holdings').select('*').eq('team_name', teamName).eq('symbol', symbol).single()
